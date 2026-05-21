@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Point Array Translator</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; max-width: 720px; margin: 40px auto; padding: 0 20px; color: #222; }
+  h1 { margin-bottom: 0.2em; }
+  p.lead { color: #555; margin-top: 0; }
+  .picker { border: 2px dashed #bbb; border-radius: 8px; padding: 24px; text-align: center; margin: 20px 0; background: #fafafa; }
+  input[type=file] { font-size: 1em; }
+  #status { padding: 12px 16px; border-radius: 6px; margin-top: 16px; white-space: pre-wrap; font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 0.92em; }
+  #status.success { background: #e8f6ec; color: #1b5e20; border: 1px solid #a5d6ac; }
+  #status.error   { background: #fbeaea; color: #8b0000; border: 1px solid #e7a1a1; }
+  #status.info    { background: #eef3fb; color: #1a3a6b; border: 1px solid #b8cce6; }
+  .hidden { display: none; }
+  code { background: #f1f1f1; padding: 1px 5px; border-radius: 3px; }
+</style>
+</head>
+<body>
+
+<h1>Point Array Translator</h1>
+<p class="lead">Transforms a Kinetic Engine Trans Point Array CSV from interleaved <code>X,Y,Z</code> layout into coordinate-grouped blocks.</p>
+
+<div class="picker">
+  <label for="file"><strong>Select an input CSV:</strong></label><br><br>
+  <input type="file" id="file" accept=".csv,text/csv" />
+</div>
+
+<div id="status" class="hidden"></div>
+
+<script>
+// === TRANSFORM_BEGIN ===
+function parseCSV(text) {
+  var hadBOM = false;
+  if (text.charCodeAt(0) === 0xFEFF) { hadBOM = true; text = text.slice(1); }
+  var lines = text.split(/\r?\n/);
+  // Drop trailing fully-empty lines
+  while (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
+  var rows = lines.map(function (line) { return line.split(','); });
+  return { rows: rows, hadBOM: hadBOM };
+}
+
+function trimPadHeaderRow(row, targetWidth) {
+  // Trim trailing empty cells, then pad up to targetWidth
+  var out = row.slice();
+  while (out.length > 0 && (out[out.length - 1] == null || String(out[out.length - 1]).trim() === '')) {
+    out.pop();
+  }
+  while (out.length < targetWidth) out.push('');
+  return out;
+}
+
+function transform(csvText) {
+  var parsed = parseCSV(csvText);
+  var rows = parsed.rows;
+  var hadBOM = parsed.hadBOM;
+  if (rows.length < 8) {
+    throw new Error('Input file has only ' + rows.length + ' rows; expected at least 8 (7 header rows + 1 or more data rows).');
+  }
+
+  // --- Row 4: extract point numbers at every 3rd column starting at col B (index 1)
+  var row4 = rows[3];
+  var pointNumbers = [];
+  for (var i = 1; i < row4.length; i += 3) {
+    var v = (row4[i] == null ? '' : String(row4[i])).trim();
+    if (v === '') break; // stop at first gap
+    pointNumbers.push(row4[i]);
+  }
+  var N = pointNumbers.length;
+  if (N === 0) {
+    throw new Error('Could not detect any point numbers in row 4. Expected numeric values at columns B, E, H, ...');
+  }
+
+  // --- Row 6: Time in sec — every 3rd starting at col B (the 1st value of each triplet group)
+  var row6 = rows[5];
+  var timeValues = [];
+  for (var p = 0; p < N; p++) {
+    var idx = 1 + p * 3;
+    timeValues.push(row6[idx] == null ? '' : row6[idx]);
+  }
+
+  // --- Data rows: row 8 onward (index 7+)
+  var dataRows = [];
+  for (var r = 7; r < rows.length; r++) {
+    var dr = rows[r];
+    if (!dr || dr.length === 0) continue;
+    var name = (dr[0] == null ? '' : String(dr[0])).trim();
+    // Skip rows that are completely blank
+    var anyVal = false;
+    for (var c = 0; c < dr.length; c++) {
+      if ((dr[c] == null ? '' : String(dr[c])).trim() !== '') { anyVal = true; break; }
+    }
+    if (!anyVal) continue;
+    dataRows.push(dr);
+  }
+  if (dataRows.length === 0) {
+    throw new Error('No data rows found after the 7-row header.');
+  }
+
+  // --- Validation against first data row (row 8)
+  var firstRow = dataRows[0];
+  var valuesAfterA = firstRow.slice(1);
+  var nonEmptyCount = 0;
+  for (var i = 0; i < valuesAfterA.length; i++) {
+    if ((valuesAfterA[i] == null ? '' : String(valuesAfterA[i])).trim() !== '') nonEmptyCount++;
+  }
+  if (nonEmptyCount % 3 !== 0) {
+    throw new Error(
+      'Validation failed: first data row contains ' + nonEmptyCount +
+      ' non-empty value cells, which is not divisible by 3. ' +
+      'Each measurement point should contribute exactly 3 values (X, Y, Z).'
+    );
+  }
+  if (nonEmptyCount !== 3 * N) {
+    throw new Error(
+      'Validation failed: first data row contains ' + nonEmptyCount +
+      ' non-empty value cells, but ' + (3 * N) +
+      ' were expected (3 × ' + N + ' points detected in row 4).'
+    );
+  }
+
+  // --- Build output rows
+  var outWidth = N + 2;
+  var out = [];
+
+  out.push(trimPadHeaderRow(rows[0], outWidth));
+  out.push(trimPadHeaderRow(rows[1], outWidth));
+  out.push(trimPadHeaderRow(rows[2], outWidth));
+
+  // Row 4: point, blank, 1, 2, ..., N
+  out.push(['point', ''].concat(pointNumbers));
+
+  // Row 5: Time in sec, blank, t1, t2, ..., tN
+  out.push(['Time in sec', ''].concat(timeValues));
+
+  // X, Y, Z blocks
+  var coords = ['X', 'Y', 'Z'];
+  for (var ci = 0; ci < 3; ci++) {
+    var coord = coords[ci];
+    for (var di = 0; di < dataRows.length; di++) {
+      var dr = dataRows[di];
+      var name = dr[0] == null ? '' : dr[0];
+      var values = [];
+      for (var pi = 0; pi < N; pi++) {
+        var colIdx = 1 + pi * 3 + ci;
+        values.push(dr[colIdx] == null ? '' : dr[colIdx]);
+      }
+      out.push([name, coord].concat(values));
+    }
+  }
+
+  var csv = out.map(function (row) { return row.join(','); }).join('\n') + '\n';
+  return hadBOM ? '﻿' + csv : csv;
+}
+// === TRANSFORM_END ===
+
+(function () {
+  var fileInput = document.getElementById('file');
+  var statusEl = document.getElementById('status');
+
+  function showStatus(msg, cls) {
+    statusEl.textContent = msg;
+    statusEl.className = cls;
+  }
+
+  fileInput.addEventListener('change', function (evt) {
+    var file = evt.target.files && evt.target.files[0];
+    if (!file) return;
+    showStatus('Reading ' + file.name + '...', 'info');
+
+    var reader = new FileReader();
+    reader.onerror = function () {
+      showStatus('Failed to read file: ' + (reader.error && reader.error.message), 'error');
+    };
+    reader.onload = function () {
+      var text = reader.result;
+      var outputCsv;
+      try {
+        outputCsv = transform(text);
+      } catch (err) {
+        showStatus('Validation / transform error:\n\n' + err.message, 'error');
+        return;
+      }
+
+      var baseName = file.name.replace(/\.csv$/i, '');
+      var outName = baseName + '_output.csv';
+
+      var blob = new Blob([outputCsv], { type: 'text/csv;charset=utf-8' });
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement('a');
+      a.href = url;
+      a.download = outName;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+
+      showStatus('Success — downloaded "' + outName + '".', 'success');
+    };
+    reader.readAsText(file);
+  });
+})();
+</script>
+
+</body>
+</html>
