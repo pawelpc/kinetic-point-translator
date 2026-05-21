@@ -1,0 +1,6 @@
+.claude/
+*.log
+
+# Local-only Claude Code briefing files — not for the public repo
+_team-lead-brief.md
+_team-lead-instructions.md
